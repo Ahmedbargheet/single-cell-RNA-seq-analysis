@@ -1,0 +1,202 @@
+---
+title: "Single-cell RNA-seq with R"
+author: "Ahmed Bargheet, PhD"
+title-block-banner: true
+format:
+  html:
+    theme: flatly
+    toc: true
+    toc-location: left
+    number-sections: true
+    code-fold: true
+execute:
+  warning: false
+  message: false
+editor: visual
+---
+
+## Import libraries
+
+```{r}
+library(tidyverse)
+library(Seurat)
+library(hdf5r)
+```
+
+## Import the dataset
+
+```{r}
+#| output: false
+# Read 10X CellRanger (HDF5) h5 format
+pbmc.data <- Read10X_h5("/Users/aba189/Downloads/20k_NSCLC_DTC_3p_nextgem_Multiplex_count_raw_feature_bc_matrix.h5", 
+                        use.names = TRUE)
+
+# Genome matrix has multiple modalities. So, run str() and then choose only one to work with. In this case, I will go with gene expression modality
+str(pbmc.data)
+
+# Get only the gene expression
+cts <- pbmc.data$`Gene Expression`
+
+# Read it in a Serate object
+nsclc.seurat.obj <- CreateSeuratObject(
+  counts = cts, project = "NSCLC",
+  min.cells = 3, # keep features that expressed in at least 3 cells
+  min.features = 200) # keep cells with at least 200 features
+
+#pbmc <- CreateSeuratObject(counts = pbmc.data, project = "PBMC20k")
+
+#pbmc
+#dim(pbmc)
+
+
+nsclc.seurat.obj
+
+# If you have a matrix object use the following 
+ # mtx <- ReadMtx(mtx = "path_to_mtx.gz",
+ #                features = "path_to_features.tsv.gz",
+ #                cells = "path_to_barcodes.tsv.gz")
+
+```
+
+## Explore the Seurat object
+
+### Metadata peek
+
+**Purpose:**
+
+-   Quickly check what information is already stored for each cell (UMIs, features, etc.).
+
+-   Get a rough idea of ranges (min, median, max).
+
+**Why important:**
+
+-   Helps you understand the dataset scale before plotting.
+
+-   Confirms Seurat correctly calculated `nCount_RNA` and `nFeature_RNA`.
+
+```{r}
+# Metadata peek
+head(nsclc.seurat.obj@meta.data)
+summary(nsclc.seurat.obj@meta.data$nCount_RNA)
+summary(nsclc.seurat.obj@meta.data$nFeature_RNA)
+```
+
+### Distributions
+
+To interpret the figures:
+
+Left (nCount_RNA): each dot = a cell.
+
+Outliers at the very top (50k–200k UMIs) → possible doublets or unusually large/active cells.
+
+Right (nFeature_RNA): most cells \~1,000–7,500 genes.
+
+Very low (\<200–500) → low-quality or empty droplets.
+
+Very high (\>8,000–10,000) → may be doublets.
+
+```{r}
+# Distributions
+VlnPlot(nsclc.seurat.obj, features = c("nCount_RNA","nFeature_RNA"), pt.size = 0.1)
+
+```
+
+### Relationship
+
+**To interpret the figure:**
+
+-   Correlation (\~0.93): very high, expected → more UMIs = more genes detected.
+
+-   The dots should follow the line because good quality data should have high number of genes and transcripts
+
+-   **Top-left (high genes, low transcripts):** usually noise or mis-called cell barcodes, not biologically valid.
+
+-   **Bottom-right (high transcripts, low genes):** strong sign of **doublets** or a few genes dominating (technical artifact).
+
+-   Outliers (far right = doublets or multiplets, bottom left = low counts, low genes, empty droplets).
+
+```{r}
+# Relationship between counts and detected genes
+FeatureScatter(nsclc.seurat.obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  geom_smooth(method = 'lm')
+
+```
+
+## Quality control
+
+### 1. Precentage of mitochonderia reads
+
+**Why mitochondria?**
+
+-   When cells are stressed, ruptured, or dying, cytoplasmic RNA leaks out but mitochondrial RNA stays, so %MT goes up.
+
+-   High %MT = poor-quality or apoptotic cells; including them can create false clusters or noise.
+
+So %MT helps you **remove dying/damaged cells** and keep your dataset biologically meaningful.
+
+```{r}
+# Mitochondrial fraction (human symbols use MT-)
+nsclc.seurat.obj[["percent.mt"]] <- PercentageFeatureSet(nsclc.seurat.obj, pattern = "^MT-")
+
+# Optional extras (uncomment if needed)
+# nsclc.seurat.obj[["percent.ribo"]] <- PercentageFeatureSet(nsclc.seurat.obj, pattern = "^RPS|^RPL")
+# nsclc.seurat.obj[["percent.hb"]]   <- PercentageFeatureSet(nsclc.seurat.obj, pattern = "^HB[AB]")
+```
+
+#### 2. Plot distributions 
+
+```{r}
+# Plot distributions
+VlnPlot(nsclc.seurat.obj, features = "percent.mt", 
+        pt.size = 0.1)
+```
+
+#### 3. Filtering and plotting after filtering
+
+```{r}
+nsclc.seurat.obj_f <- subset(nsclc.seurat.obj, 
+                           subset = nFeature_RNA >= 200 & nFeature_RNA <= 6000 & 
+                                    nCount_RNA <= 30000 & 
+                                    percent.mt <= 10)
+
+```
+
+```{r}
+VlnPlot(nsclc.seurat.obj_f, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+```{r}
+# Relationship between counts and detected genes
+FeatureScatter(nsclc.seurat.obj_f, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  geom_smooth(method = 'lm')
+```
+
+## Normalization
+
+To account for sequencing depth but **SCTransform account also for MT%**. So if two cells look different only because one has high MT%, SCTransform makes them look more similar (unless there are real biological differences too).
+
+#### 1. **LogNormalize** (classic)
+
+-   Scales each cell to the same library size (default = 10,000 UMIs).
+
+-   Then log-transforms counts.
+
+```{r}
+nsclc.seurat.obj <- NormalizeData(nsclc.seurat.obj_f, 
+                                  normalization.method = "LogNormalize", 
+                                  scale.factor = 10000)
+```
+
+#### 2. **SCTransform** (advanced)
+
+-   Uses regularized negative binomial regression for every gene across all cells. That is why it is slow but better
+
+-   Corrects for sequencing depth and technical noise more effectively.
+
+-   Often improves clustering, especially in complex tissues (tumor, heterogeneous samples).
+
+```{r}
+nsclc.seurat.obj <- SCTransform(nsclc.seurat.obj_f, 
+                                vars.to.regress = "percent.mt", verbose = FALSE)
+
+```
