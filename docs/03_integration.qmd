@@ -1,0 +1,189 @@
+---
+title: "Intergration"
+author: "Ahmed Bargheet, PhD"
+title-block-banner: true
+format:
+  html:
+    theme: flatly
+    toc: true
+    toc-location: left
+    number-sections: true
+    code-fold: true
+execute:
+  warning: false
+  message: false
+editor: visual
+---
+
+# Import libraries
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(gridExtra)
+library(harmony)
+library(patchwork)
+library(RColorBrewer)
+```
+
+# Create Seurat objects
+
+```{r}
+dirs <- list.dirs(path = "/Users/aba189/Downloads/GSE180665_RAW/", 
+                  recursive = F, full.names = F)
+
+for(i in dirs){
+  name <- gsub("_filtered_feature_bc_matrix","", i)
+  
+  cts <- ReadMtx(mtx = paste0("/Users/aba189/Downloads/GSE180665_RAW/", i, "/matrix.mtx.gz"),
+          features = paste0("/Users/aba189/Downloads/GSE180665_RAW/", i,"/features.tsv.gz"),
+          cells = paste0("/Users/aba189/Downloads/GSE180665_RAW/", i,"/barcodes.tsv.gz"))
+  
+  # create seurat objects
+  assign(name, CreateSeuratObject(counts = cts))
+}
+```
+
+# Merge Seurat objects
+
+Got names from ls() (my R environment)
+
+Got numbers from the ls()
+
+```{r}
+merged_seurat <- merge(HB17_background, 
+                       y = c(HB17_PDX, HB17_tumor, HB30_PDX, 
+                             HB30_tumor, HB53_background,HB53_tumor),
+      add.cell.ids = ls()[3:9], # to assign each cell for each dataset
+      project = 'HB')
+```
+
+## Create a sample column
+
+```{r}
+merged_seurat@meta.data <- merged_seurat@meta.data %>% mutate(sample = rownames(.)) %>% 
+  separate(sample, into = c("patient", "type", "barcode"), sep = "_") 
+```
+
+# Quality control
+
+## Percentage of mitochonderia reads
+
+```{r}
+# Mitochondrial fraction (human symbols use MT-)
+merged_seurat$mitoPercent <- PercentageFeatureSet(merged_seurat, pattern = "^MT-")
+
+# Optional extras (uncomment if needed)
+# merged_seurat[["percent.ribo"]] <- PercentageFeatureSet(merged_seurat, pattern = "^RPS|^RPL")
+# merged_seurat[["percent.hb"]]   <- PercentageFeatureSet(merged_seurat, pattern = "^HB[AB]")
+```
+
+## Plot distributions
+
+```{r}
+VlnPlot(merged_seurat, features = c("nCount_RNA","nFeature_RNA", "mitoPercent"))
+```
+
+## Filtering and plotting after filtering
+
+```{r}
+merged_seurat_f <- subset(merged_seurat, 
+                           subset = nFeature_RNA >= 200 & nFeature_RNA <= 6000 & 
+                                    nCount_RNA >= 1000 & nCount_RNA <= 20000 & 
+                                    mitoPercent <= 10)
+```
+
+```{r}
+VlnPlot(merged_seurat_f, features = c("nFeature_RNA", "nCount_RNA", "mitoPercent"))
+```
+
+```{r}
+# Relationship between counts and detected genes
+FeatureScatter(merged_seurat_f, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  geom_smooth(method = 'lm')
+```
+
+# Standard Workflow
+
+## Normalization
+
+```{r}
+merged_seurat_f <- NormalizeData(merged_seurat_f, 
+                                  normalization.method = "LogNormalize", 
+                                  scale.factor = 10000)
+merged_seurat_f <- FindVariableFeatures(object = merged_seurat_f)
+merged_seurat_f <- ScaleData(object = merged_seurat_f)
+```
+
+## Dimensionality reduction
+
+```{r}
+merged_seurat_f <- RunPCA(merged_seurat_f, 
+                           features = VariableFeatures(object = merged_seurat_f))
+
+# determine dimensionality of the data
+ElbowPlot(merged_seurat_f)
+```
+
+## Clustering and UMAP
+
+```{r}
+merged_seurat_f <- FindNeighbors(merged_seurat_f, dims = 1:20)
+merged_seurat_f <- FindClusters(merged_seurat_f)
+merged_seurat_f <- RunUMAP(merged_seurat_f, dims = 1:20)
+```
+
+### Plot
+
+```{r}
+
+p1 <- DimPlot(merged_seurat_f, reduction = "umap", group.by = "patient",) + 
+  scale_color_brewer(palette = "Set2")
+
+p2 <- DimPlot(merged_seurat_f, reduction = "umap", group.by = "type") + 
+  scale_color_brewer(palette = "Set1")
+
+
+(p1 | p2)
+
+```
+
+Plot to see the difference between sequencing depth for each patient, indicating batch effect
+
+```{r}
+FeaturePlot(merged_seurat_f, c("nCount_RNA","nFeature_RNA","mitoPercent"), order=TRUE)
+
+```
+
+plot to see median depth for across patients
+
+```{r}
+VlnPlot(merged_seurat_f, c("nCount_RNA","nFeature_RNA","mitoPercent"), group.by="patient")
+```
+
+# Integration
+
+Integrate clusters from the same patient together
+
+## Integration using Harmony package
+
+```{r}
+merged_seurat_f <- RunHarmony(merged_seurat_f, group.by.vars = "patient", 
+                              dims.use = 1:20, theta = 6)
+merged_seurat_f <- FindNeighbors(merged_seurat_f, reduction = "harmony", dims = 1:20)
+merged_seurat_f <- FindClusters(merged_seurat_f, resolution = 0.1)
+merged_seurat_f <- RunUMAP(merged_seurat_f, reduction = "harmony", dims = 1:20)
+```
+
+## plot 
+
+```{r}
+
+p3 <- DimPlot(merged_seurat_f, reduction = "umap", group.by = "patient") + 
+  scale_color_brewer(palette = "Set2") + ggtitle("Harmony - Patient")
+
+p4 <- DimPlot(merged_seurat_f, reduction = "umap", group.by = "type") + 
+  scale_color_brewer(palette = "Set1") + ggtitle("Harmony - type")
+
+(p1 | p2) / (p3 | p4) + plot_layout(guides = "collect")
+```
